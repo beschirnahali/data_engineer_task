@@ -1,237 +1,203 @@
-# Senior Data Engineer Assignment - Corporate Credit Rating Data Pipeline
+# Solution README
 
-## Overview
-Build a production-ready data pipeline that extracts corporate metadata from the MASTER sheet of Excel files, models it in a dimensional warehouse with temporal tracking, and exposes it through a RESTful API. The entire solution must be containerized using Docker Compose.
+## Summary
+This project implements a production-oriented ETL pipeline and API for corporate credit rating workbooks.
 
-## Scenario
-You work for a credit rating analytics firm (similar to S&P, Moody's, Fitch). Analysts upload Excel-based rating assessments for corporate entities. Each Excel file contains multiple sheets, but **you only need to extract the MASTER sheet**, which contains:
-- Company metadata (entity name, sector, country, currency)
-- Rating methodology information
-- Industry risk scores and weights
-- Accounting principles and business year-end data
+The solution:
+- extracts key-value data from the `MASTER` sheet of `.xlsm` files
+- validates raw fields before loading
+- transforms workbook fields into a normalized warehouse shape
+- stores upload history and temporal snapshots in PostgreSQL
+- exposes the data through FastAPI endpoints for current, historical, and upload views
 
-The MASTER sheet has a non-standard structure (key-value pairs with "Unnamed" column headers) that requires custom parsing.
+The solution satisfies all core functional requirements: historical tracking, point-in-time queries, versioning, and data lineage.
 
-Your task is to build a data platform that enables:
-- Historical tracking of all rating submissions (requirement #1)
-- Point-in-time company comparisons (requirement #2)
-- Time-series analysis of individual companies (requirement #3)
-- Version control for multiple uploads per company/discussion (requirement #4)
-- Data classification for countries, company names, currencies (requirement #5)
-- Time-series data availability (requirement #6)
-- Data validation (requirement #7)
-- BI tool integration (requirement #8)
+## Architecture
+The implementation is organized as a simple ETL flow:
 
-## Task Breakdown
+`extract -> validate -> transform -> load`
 
-### 1. Data Extraction & Ingestion
-**Challenges:**
-- Extract data from .xlsm files (Excel with macros) - **MASTER sheet only**
-- Handle non-standard headers (many "Unnamed: X" columns requiring custom parsing)
-- MASTER sheet has key-value pair structure (40 rows × 13 columns)
-- Column headers are "Unnamed: 0-12", actual labels in column 1, values in column 2
-- Preserve file-level metadata (upload timestamp, source filename, version info)
+Main modules:
+- `app/services/extractor.py`: reads the `MASTER` sheet and builds a raw field dictionary
+- `app/services/validator.py`: checks required fields and weight validity
+- `app/services/transformer.py`: maps workbook labels to normalized output fields
+- `app/services/loader.py`: enforces idempotency by file hash and writes uploads, companies, and snapshots
+- `app/pipeline/orchestrator.py`: runs the end-to-end folder pipeline
+- `app/api/routes.py`: exposes query endpoints over the warehouse tables
 
-**Requirements:**
-- Create extraction module that handles MASTER sheet from each file
-- Implement custom parsing for key-value pair structure (not standard table format)
-- Extract company metadata:
-  - Rated entity name
-  - Corporate sector classification
-  - Rating methodologies applied
-  - Industry risk scores and weights
-  - Currency, country, accounting principles
-  - Business year-end month
-- Generate data quality reports per file (missing fields, invalid values)
-- Track data lineage (source file → extracted data → database table)
+## Data Model
+The warehouse uses three tables:
 
-**Business Context:**
-- Files: corporates_A_1.xlsm, corporates_A_2.xlsm, corporates_B_1.xlsm, corporates_B_2.xlsm
-- A_1 vs A_2: Same company, different versions (industry risk A → BBB)
-- B_1 vs B_2: Same company, different versions (weight changes)
-- Only MASTER sheet needs to be extracted per file
+- `dim_company`: company master data
+- `dim_upload`: uploaded file metadata and file hash
+- `fact_snapshot`: versioned rating snapshot linked to company and upload
 
-### 2. Data Modeling & Warehouse Design
-**Challenges:**
-- Design dimensional model for corporate metadata tracking
-- Implement temporal tracking (point-in-time + time-series)
-- Handle version control for multiple uploads per company/discussion
-- Model multi-currency data (EUR, CHF)
-- Handle slowly changing dimensions for company metadata
+Temporal tracking is handled in `fact_snapshot` with:
+- `valid_from`
+- `valid_to`
+- `is_current`
 
+When a newer version of the same company is loaded, the previous current snapshot is closed and a new current snapshot is inserted.
 
-### 3. Data Pipeline Orchestration
-**Challenges:**
-- Implement incremental loading (only process new/changed files)
-- Handle pipeline failures gracefully (transaction management)
-- Ensure idempotency (re-run same file → no duplicates)
-- Track pipeline execution state
-- Validate extracted data
+The model guarantees exactly one current snapshot per company at any time.
 
-**Requirements:**
-- Create ETL pipeline with clear stages: Extract → Validate → Transform → Load
-- Implement **validation rules** (requirement #7)
-- Add retry logic with exponential backoff for transient failures
-- Log pipeline execution metrics (files processed, rows extracted, errors, duration)
-- Maintain pipeline state (last successful run, processed files list)
-- Generate data quality report per run (validation failures, warnings, summary stats)
+## Key Design Decisions
+- SCD Type 2 for historical tracking
+- file hash deduplication for idempotency
+- modular ETL design for clarity and testability
+- PostgreSQL as warehouse backend
+- FastAPI for lightweight analytics API
 
-**Validation Framework:**
-- Check required fields are present
-- Validate data types (numeric, text, date)
-- Validate numeric ranges (weights sum to 1.0, scores in valid range)
-- Flag missing or suspicious values
-- Report on data quality metrics (completeness, validity rates)
+## Pipeline Behavior
+The pipeline processes `.xlsm` files from the `data/` folder in sorted order.
 
-### 4. API Development with FastAPI
-**Challenges:**
-- Design RESTful endpoints for complex analytical queries
-- Support point-in-time queries (requirement #2)
-- Support time-series queries (requirement #6)
-- Handle version navigation (requirement #4)
-- Implement BI-friendly data access (requirement #8)
+Implemented behavior:
+- reads only the `MASTER` worksheet
+- parses labels from column 2 and values from column 3
+- skips non-`.xlsm` files
+- validates required fields before loading
+- processes only new files based on file hash (incremental ingestion)
+- avoids duplicate processing by hashing file contents
+- logs file status, validation results, insert/update actions, and total execution time
 
-**Requirements:**
-- **Company Endpoints:**
-  - GET /companies - List all companies with current metadata
-  - GET /companies/{company_id} - Get company details (latest version)
-  - GET /companies/{company_id}/versions - Get all versions for a company (requirement #4)
-  - GET /companies/{company_id}/history - Get time-series data for analysis (requirement #3)
-  - GET /companies/compare - Compare multiple companies at specific point in time (requirement #2)
-    - Query params: company_ids, as_of_date
+## Data Lineage
+The pipeline maintains lineage from source file to warehouse:
 
-- **Snapshot Endpoints:**
-  - GET /snapshots - List all company snapshots with filters
-    - Query params: company_id, from_date, to_date, sector, country, currency
-  - GET /snapshots/{snapshot_id} - Get specific snapshot details
-  - GET /snapshots/latest - Get latest snapshot for each company
+`source file -> dim_upload -> fact_snapshot`
 
-- **Upload Audit Endpoints:**
-  - GET /uploads - List all file uploads with metadata (requirement #1)
-  - GET /uploads/{upload_id}/details - Get specific upload details
-  - GET /uploads/{upload_id}/file - Download original file (requirement #1)
-  - GET /uploads/stats - Upload statistics and metrics
+Each snapshot is linked to:
+- `file_name`
+- `file_hash`
+- `uploaded_at`
 
-- **Technical:**
-  - Pydantic models for request/response validation
-  - OpenAPI/Swagger documentation
-  - Proper HTTP status codes and error messages
+## Data Quality
+Each processed file produces a validation report:
 
-### 5. Containerization & Infrastructure
-**Challenges:**
-- Multi-container orchestration with proper dependencies
-- Data persistence across container restarts
-- Environment configuration management
-- Health checks and startup order
+```json
+{
+  "valid": true,
+  "errors": [],
+  "warnings": [],
+  "summary": {
+    "fields_checked": 30,
+    "fields_present": [
+    ]
+  }
+}
+```
 
-**Requirements:**
-- **Docker Compose** with services:
-  ```yaml
-  services:
-    postgres:
-      - PostgreSQL 15+ for data warehouse
-      - Initialize with schema on first run
-      - Volume for data persistence
-      - Health check endpoint
+## API
+Implemented endpoints:
 
-    api:
-      - FastAPI application
-      - Depends on postgres health
-      - Volume mount for data files
-      - Environment variables for config
-      - Exposed on port 8000
-  ```
+- `GET /companies`
+- `GET /companies/{id}`
+- `GET /companies/{id}/versions`
+- `GET /companies/{id}/history`
+- `GET /companies/compare`
+- `GET /snapshots`
+- `GET /snapshots/{id}`
+- `GET /snapshots/latest`
+- `GET /uploads`
+- `GET /uploads/{upload_id}`
+- `GET /uploads/stats`
 
-- **One-command startup:**
-  ```bash
-  docker-compose up -d
-  ```
+These endpoints support listing current entities, viewing version history, comparing point-in-time snapshots, and auditing uploads.
 
-## Requirements & Evaluation Criteria
+## Running
+Start the stack:
 
-### 1. Data Engineering
-- Robust Excel extraction with non-standard header handling
-- Efficient data management
-- Comprehensive data quality checks and reporting
-- Data lineage tracking from source to warehouse
-- Proper error handling and logging
+```bash
+docker-compose up --build
+```
 
-### 2. Data Modeling & System Design
-- Well-designed dimensional model (star schema)
-- Version control strategy for multiple uploads
-- Appropriate indexing and partitioning
-- Meets all 8 business requirements from Requirements sheet
+Run the pipeline:
 
-### 3. Pipeline Orchestration
-- Validation framework
-- State management (tracking processed files)
-- Comprehensive error handling and retry logic
-- Data quality reporting
-- Monitoring and logging
+```bash
+docker exec -it data_engineer_task-api-1 \
+python -m app.pipeline.orchestrator
+```
 
-### 4. API Design & Implementation
-- Clean RESTful API design
-- Point-in-time and time-series query support
-- Complex filtering and aggregation
-- BI-friendly data access
-- Proper validation and error handling
-- Complete OpenAPI documentation
+The API is exposed on `http://localhost:8000`.
 
-### 5. Infrastructure & Containerization
-- Working Docker Compose with all services
-- Proper service orchestration and dependencies
-- Data persistence configuration
-- Health checks implemented
-- Environment variable management
-- One-command startup
+Swagger documentation is available at `http://localhost:8000/docs#/`.
 
-### 6. Code Quality (Qualitative)
-- Clean architecture (separation of concerns)
-- Type hints throughout
-- Unit and integration tests
-- Logging and monitoring
-- Code documentation
+## Testing
+Run the test suite inside the API container:
+
+```bash
+docker exec -it data_engineer_task-api-1 poetry run pytest
+```
+
+Coverage:
+- unit tests (transform, validation)
+- pipeline tests (idempotency, versioning)
+- API tests (endpoints)
+- integration tests (real Excel files + DB)
+
+## Example API Outputs
+Example current snapshots:
+
+```json
+[
+  {
+    "id": 2,
+    "company_id": 1,
+    "industry_score": "BBB",
+    "currency": "EUR",
+    "year_end": "December",
+    "is_current": true
+  }
+]
+```
+
+Example upload stats:
+
+```json
+{
+  "total_uploads": 4
+}
+```
+
+Example company history:
+
+```json
+[
+  {
+    "industry_score": "A"
+  },
+  {
+    "industry_score": "BBB"
+  }
+]
+```
+
+## Pipeline Observability
+The pipeline logs:
+- file processing status
+- validation failures
+- insert/update actions
+- total execution time
+
+## Scope
+The implementation focuses on core ingestion, versioning, and query capabilities required by the assignment, with a lean and maintainable design.
+
+## Limitations / Future Improvements
+
+- Extend validation rules (range checks, schema enforcement)
+- Add retry/backoff and failure handling in pipeline
+- Introduce orchestration state tracking (e.g. Airflow/metadata store)
+- Expand API filtering and querying capabilities
 
 ## Deliverables
 
-1. **Source Code Repository**
+- Source code (modular ETL pipeline and FastAPI service)
+- Docker Compose setup (PostgreSQL + API)
+- Data warehouse (dimensional model with SCD Type 2 snapshots)
+- Test suite (unit, API, pipeline, and integration tests)
 
-2. **Docker Compose Setup**
+- Sample outputs (under `outputs/`):
+  - `outputs/api/` — 10 example API calls with responses
+  - `outputs/pipeline.log` — pipeline execution logs
+  - `outputs/data_quality.json` — validation report example
 
-3. **Sample Outputs**
-   - At least 10 API call examples with responses
-   - Data quality report example
-   - Pipeline execution log example
-
-4. **Tests**
-
-7. **AI Usage Disclosure** (REQUIRED)
-   - Create AI_USAGE.md documenting:
-     - Which AI tools used (ChatGPT, Claude, Copilot, etc.)
-     - Which components received AI assistance
-     - Chat logs/screenshots (can redact personal info)
-
-## Tech Stack
-
-**Required:**
-- Python 3.10+
-- FastAPI (web framework)
-- PostgreSQL (data warehouse)
-- Docker & Docker Compose
-- SQLAlchemy (ORM) or raw SQL
-
-
-## Non-Goals
-
-You do NOT need to:
-- Build a frontend UI (focus on API only)
-- Implement authentication/authorization
-- Deploy to cloud (AWS/Azure/GCP)
-- Implement real-time streaming
-- Handle production monitoring at scale
-- Support Excel file uploads via API (files provided in data/ directory)
-
-
-## Task Timeline
-
-Complete within **5-7 days**.
+- AI usage disclosure (see `AI_USAGE.md`)
